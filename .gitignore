@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Generated locally when running the skill — never commit campaign data or reports
+*.csv
+*.xlsx
+*.xls
+*_report.html
+*_full.json
+*_diagnosis.json
+cid_map*.json

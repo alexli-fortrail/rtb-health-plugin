@@ -1,0 +1,14 @@
+{
+  "name": "appier-rtb-tools",
+  "description": "Internal Claude Code tools for RTB campaign analysis and reporting.",
+  "owner": {
+    "name": "Alex Li"
+  },
+  "plugins": [
+    {
+      "name": "rtb-health",
+      "source": "./",
+      "description": "Weekly RTB campaign export → shareable HTML campaign-health report."
+    }
+  ]
+}

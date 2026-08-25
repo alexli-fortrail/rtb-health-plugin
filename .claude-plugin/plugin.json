@@ -1,0 +1,15 @@
+{
+  "name": "rtb-health",
+  "description": "Analyze a weekly RTB campaign export (xlsx/csv) and produce a shareable HTML campaign-health report: goal-oriented health check, by-SSP then by-SSP+Ad-Group goal analysis, and a written diagnosis.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Alex Li"
+  },
+  "keywords": [
+    "rtb",
+    "campaign-health",
+    "appier",
+    "aibid",
+    "reporting"
+  ]
+}
