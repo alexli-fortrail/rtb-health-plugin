@@ -6,20 +6,39 @@ and an All-Time / Latest-Week campaign health scan.
 
 Modes:
   discover <file> [--cid FILE]
-      Quick pass: column mapping, metric list + detected types, weeks, ad-group/SSP
-      counts. Used to ask an informed "what's your goal" question.
+      Cheap first pass: column mapping, metric list + detected types, weeks,
+      ad-group/SSP counts. Use it to ask an informed "what's your goal" question.
 
-  analyze <file> --rules JSON [--cid FILE] [--filters JSON]
-      Full pass: z-score anomalies, chained goal-rule flags, WoW %, per-metric
-      summary (avg/total), SSP breakdown, anomaly counts. Outputs JSON on stdout.
+  estimate <file> [--cid FILE]
+      Cheap pre-flight sizing: how big the detailed output will be, what the
+      lite run would cost instead, and a light/medium/heavy band. Use it to warn
+      the user before an expensive run.
 
-  export <file> --out CSV [--rules JSON] [--cid FILE] [--filters JSON]
-      Writes the current (rules+filters scoped) view to a CSV file, mirroring the
-      html's "Export CSV" button.
+  full <file> [--rules JSON] [--filters JSON] [--lite] [--max-weeks N]
+       [--top-groups N] [--cid FILE]
+      health + analyze in one pass, parsing the file only once. This is the
+      normal entry point. --lite trims the per-group x week x metric matrix
+      (the bulk of the output) without changing any surviving number.
 
-All numeric formatting (formatVal), metric-type detection (detectMetricType), the
-z-score anomaly rule, and the goal-rule chain (R1 = all weeks; R2/R3 scoped to
-groups that survived prior rules on the latest week) are ported 1:1 from the html.
+  health <file> [--cid FILE]
+      Health scan only: All Time + Latest Week, ROAS windows, CTCV/VTCV, CPI,
+      per-SSP win rate/CPM, list-tag breakdown, WoW structure changes.
+
+  analyze <file> --rules JSON [--filters JSON] [--cid FILE]
+      Goal analysis only: z-score anomalies, chained goal-rule flags, WoW %,
+      per-metric summary, SSP breakdown + SSP-level goal evaluation.
+
+  export <file> --out CSV [--rules JSON] [--filters JSON] [--cid FILE]
+      Writes the current (rules+filters scoped) view to a CSV file.
+
+  allocation <file> --target JSON [--scope latest|all_time] [--cid FILE]
+      Actual per-SSP cost share vs. a user-supplied target allocation.
+
+Aggregation notes: CPA is volume-weighted (total cost / total valid action),
+as are per-SSP win rate (total win / total bid) and CPM (total cost / total
+impressions x 1000). Ratio metrics without separate numerator/denominator
+columns in the export (ROAS, CTCV/VTCV rate) are averaged per row instead —
+see the SKILL.md notes for why, and read those numbers with volume in mind.
 """
 import argparse
 import json
@@ -36,7 +55,7 @@ DEFAULT_CID_MAP_PATH = SCRIPT_DIR.parent / "assets" / "cid_map_default.json"
 
 
 # ---------------------------------------------------------------------------
-# Metric type detection (ported from detectMetricType() in the html)
+# Metric type detection — drives formatting and avg-vs-total aggregation
 # ---------------------------------------------------------------------------
 def detect_metric_type(name):
     n = name.lower()
@@ -55,7 +74,7 @@ def detect_metric_type(name):
 
 
 # ---------------------------------------------------------------------------
-# Value formatting (ported from formatVal() in the html)
+# Value formatting — per-type display rules ($ / % / K,M / dashes for zero)
 # ---------------------------------------------------------------------------
 def format_val(v, metric_type):
     if v is None or v == "":
@@ -150,7 +169,7 @@ def load_cid_map(cid_map_path, cid_file_path=None):
 
 
 # ---------------------------------------------------------------------------
-# Column mapping + row parsing (ported from parseAndRender() in the html)
+# Column mapping + row parsing
 # ---------------------------------------------------------------------------
 def detect_col_map(all_cols):
     def find(pattern):
@@ -229,7 +248,7 @@ def parse_rows(raw_rows, all_cols, cid_map):
 
 
 # ---------------------------------------------------------------------------
-# Anomaly detection (ported from computeAnomalies() in the html) — z-score,
+# Anomaly detection — z-score,
 # computed once over ALL rows, unaffected by filters/goal rules.
 # ---------------------------------------------------------------------------
 def compute_anomalies(all_rows, metric_cols):
@@ -271,7 +290,7 @@ def has_anomaly_in_row(r, metric_cols, anomaly_map):
 
 
 # ---------------------------------------------------------------------------
-# Filtering (ported from getFilteredRows() in the html)
+# Filtering
 # ---------------------------------------------------------------------------
 def get_filtered_rows(all_rows, filters, latest_status_map, latest_week_va_map, va_col_name, metric_cols, anomaly_map):
     filters = filters or {}
@@ -309,7 +328,7 @@ def get_filtered_rows(all_rows, filters, latest_status_map, latest_week_va_map, 
 
 
 # ---------------------------------------------------------------------------
-# Goal rule chain (ported from renderTable()'s rule logic in the html)
+# Goal rule chain
 # ---------------------------------------------------------------------------
 def apply_goal_rules(groups, latest_week, goal_rules):
     """groups: dict gk -> {"meta":row, "byWeek": {week: row}}"""
@@ -433,7 +452,7 @@ def list_tags(ad_group_name):
     ad groups differently, so there is no single pattern that reliably reads
     off "what list is this ad group actually running." This only catches what
     happens to be spelled out in the name using patterns seen in real exports/
-    Slack so far; an ad group named differently will fall into "No list tag
+    real exports so far; an ad group named differently will fall into "No list tag
     detected" even if it's genuinely running one of these. Treat the resulting
     breakdown as a rough signal to sanity-check, not a ground-truth dimension —
     say so when presenting it, per the user's own caution about this (2026-07-
@@ -571,7 +590,7 @@ def ssp_efficiency_rows(rows, ssps, win_rate_col, cpm_col, bid_col, win_col, imp
     """Win Rate + CPM per SSP — lets you tell 'no supply anywhere' (both low)
     from 'being outbid' (low win rate, normal CPM) from 'structurally cheap/
     expensive inventory' (CPM itself is the outlier) — a distinction real AM/CM
-    Slack threads make constantly and the plain cost/action share tables can't.
+    campaign managers make constantly, and plain cost/action share can't show it.
 
     Volume-weighted (total Win / total Bid, total Cost / total Impression*1000)
     when Bid/Win/Impression columns exist — NOT a naive average of each row's
@@ -613,7 +632,7 @@ def ssp_efficiency_rows(rows, ssps, win_rate_col, cpm_col, bid_col, win_col, imp
 def structure_changes(latest_rows, prior_rows, prior_week):
     """Which ad_group_id+SSP combos newly appeared or disappeared between the
     prior week and the latest week. Answers the first branch of a real
-    recurring AM/CM diagnosis question (paraphrased from Slack): 'is this WoW
+    recurring campaign-manager diagnosis question: 'is this WoW
     swing because our own CID/ad-group structure changed, because something
     changed on the client's side, or because we changed a policy/target?' —
     this only ever answers the first branch (it's the only one visible from
@@ -818,15 +837,79 @@ def cmd_full(args):
     cid_map = load_cid_map(args.cid_map_default, args.cid)
     parsed = parse_rows(raw_rows, all_cols, cid_map)
     health = build_health_check(args.file, args.cid_map_default, args.cid, parsed=parsed)
-    analysis = build_analysis(args.file, args.cid_map_default, args.cid, args.rules, args.filters, parsed=parsed)
+    analysis = build_analysis(
+        args.file, args.cid_map_default, args.cid, args.rules, args.filters, parsed=parsed,
+        lite=getattr(args, "lite", False),
+        max_weeks=getattr(args, "max_weeks", None),
+        top_groups=getattr(args, "top_groups", None),
+    )
     json.dump({"health": health, "analysis": analysis}, sys.stdout, indent=2, ensure_ascii=False)
     print()
 
 
 # ---------------------------------------------------------------------------
+# estimate — cheap pre-flight sizing so the caller can warn the user (and offer
+# a lite run) BEFORE doing the expensive work. Parses the file but emits only
+# counts, so it costs almost nothing to run.
+#
+# The band thresholds and the bytes-per-cell constant below are calibrated from
+# real files measured during development (~170 bytes of JSON per
+# group x week x metric cell; e.g. 188 groups x 8 weeks x 35 metrics produced a
+# ~4.8 MB group matrix). They are a rough workload signal, NOT a token count —
+# actual token use depends on how much of the output the caller reads back.
+# ---------------------------------------------------------------------------
+BYTES_PER_CELL = 170
+
+
+def cmd_estimate(args):
+    raw_rows, all_cols = load_raw_rows(args.file)
+    cid_map = load_cid_map(args.cid_map_default, args.cid)
+    parsed = parse_rows(raw_rows, all_cols, cid_map)
+
+    all_rows = parsed["all_rows"]
+    n_metrics = len(parsed["metric_cols"])
+    n_weeks = len(parsed["weeks"])
+    n_groups = len({(r["ad_group_id"], r["ssp"]) for r in all_rows})
+    cells = n_groups * n_weeks * n_metrics
+    est_bytes = cells * BYTES_PER_CELL
+
+    # Banded on estimated output size rather than raw cell count — size is what
+    # actually costs the caller, and it's the number worth telling the user.
+    est_mb = est_bytes / 1_048_576
+    if est_mb < 0.5:
+        band, advice = "light", "detailed run is fine, no need to warn the user"
+    elif est_mb < 3:
+        band, advice = "medium", "detailed run is usually fine; mention lite if the user is budget-conscious"
+    else:
+        band, advice = "heavy", "warn the user and offer the lite run before proceeding"
+
+    # What the lite preset would reduce it to (mirrors build_analysis's defaults).
+    lite_metrics = min(n_metrics, 8)
+    lite_cells = min(n_groups, 15) * min(n_weeks, 2) * lite_metrics
+
+    out = {
+        "importFile": str(Path(args.file).name),
+        "adGroupSspCombos": n_groups,
+        "weeks": n_weeks,
+        "metrics": n_metrics,
+        "rows": len(all_rows),
+        "detailed": {"cells": cells, "approxJsonBytes": est_bytes,
+                     "approxJsonMB": round(est_mb, 1)},
+        "lite": {"cells": lite_cells, "approxJsonBytes": lite_cells * BYTES_PER_CELL,
+                 "approxJsonMB": round(lite_cells * BYTES_PER_CELL / 1_048_576, 2),
+                 "smallerByFactor": (f"~{round(cells / lite_cells)}x" if lite_cells else "n/a")},
+        "band": band,
+        "advice": advice,
+        "note": "Rough workload sizing from real-file calibration, not a token count.",
+    }
+    json.dump(out, sys.stdout, indent=2, ensure_ascii=False)
+    print()
+
+
+# ---------------------------------------------------------------------------
 # allocation — actual cost share per SSP vs. a user-supplied target %.
-# Models the "manual cost-rate allocation plan" pattern from real AM/CM Slack
-# threads (e.g. "google 20%, smaato 30%, rubicon 10%..."), which the file
+# Models the common "manual cost-rate allocation plan" pattern
+# (e.g. "google 20%, smaato 30%, rubicon 10%..."), which the file
 # itself has no notion of — the target has to come from the user every time,
 # there's nothing to detect it from.
 # ---------------------------------------------------------------------------
@@ -886,7 +969,16 @@ def cmd_allocation(args):
 # ---------------------------------------------------------------------------
 # analyze
 # ---------------------------------------------------------------------------
-def build_analysis(args_file, cid_map_default, cid_file, rules_json, filters_json, parsed=None):
+def build_analysis(args_file, cid_map_default, cid_file, rules_json, filters_json, parsed=None,
+                   lite=False, max_weeks=None, top_groups=None):
+    """`lite=True` trims the per-group×week×metric matrix — by far the biggest
+    part of this output (measured: ~10 KB for the health scan vs ~4.8 MB for
+    the group matrix on a 188-group × 8-week × 35-metric file). It keeps the
+    goal metrics plus a few core ones, the last 2 weeks, and the most relevant
+    groups, so a caller working under a tight token budget can still get a
+    correct answer to the stated goal. Nothing is approximated — the numbers
+    that survive the trim are computed identically; there is simply less of
+    them. max_weeks/top_groups override the lite defaults when given."""
     if parsed is None:
         raw_rows, all_cols = load_raw_rows(args_file)
         cid_map = load_cid_map(cid_map_default, cid_file)
@@ -909,13 +1001,43 @@ def build_analysis(args_file, cid_map_default, cid_file, rules_json, filters_jso
 
     cost_col = find_metric_col(metric_cols, r"^raw cost$", r"raw.?cost", r"cost")
 
+    # Anomalies are a property of the data, so both the map AND the reported
+    # counts are computed over the untrimmed metric set / week range. Keeping
+    # copies here means anomalyCounts reads identically on a lite and a detailed
+    # run — otherwise a lite run silently under-reports them, which would make
+    # "no anomalies" indistinguishable from "we didn't look".
     anomaly_map = compute_anomalies(all_rows, metric_cols)
     filtered = get_filtered_rows(
         all_rows, filters, parsed["latest_status_map"], parsed["latest_week_va_map"],
         parsed["va_col_name"], metric_cols, anomaly_map,
     )
+    filtered_untrimmed = filtered
+    metric_cols_untrimmed = list(metric_cols)
+
+    if lite:
+        # Keep the goal metrics plus the handful needed to judge whether a
+        # result is trustworthy (volume, spend, efficiency) — dropping the rest
+        # is where nearly all the size saving comes from.
+        keep = []
+        for rule in goal_rules:
+            if rule["metric"] not in keep:
+                keep.append(rule["metric"])
+        for pat in (r"^valid action$", r"valid.?action", r"^raw cost$", r"raw.?cost",
+                    r"^raw cpa$", r"^cpa$", r"^cpi$", r"^win rate$", r"^raw cpm$", r"^cpm$"):
+            c = find_metric_col(metric_cols, pat)
+            if c and c not in keep:
+                keep.append(c)
+        metric_cols = [m for m in metric_cols if m in keep]
+        if max_weeks is None:
+            max_weeks = 2
+        if top_groups is None:
+            top_groups = 15
 
     sorted_weeks = sorted({r["date_range"] for r in filtered}, reverse=True)
+    if max_weeks:
+        sorted_weeks = sorted_weeks[:max_weeks]
+        kept_weeks = set(sorted_weeks)
+        filtered = [r for r in filtered if r["date_range"] in kept_weeks]
 
     # Grouped by ad_group_id (not name) — an ad group's display name can change
     # mid-campaign in the platform (same ID, retargeted/renamed) while its ID
@@ -934,10 +1056,11 @@ def build_analysis(args_file, cid_map_default, cid_file, rules_json, filters_jso
 
     survived_up_to, rules_fired_map = apply_goal_rules(groups, latest_week, goal_rules)
 
-    # anomaly + rule-flag counts over the filtered view
+    # anomaly counts over the untrimmed view (see note above), so lite and
+    # detailed runs report the same figure
     anomaly_counts = {"high": 0, "low": 0}
-    for r in filtered:
-        for m in metric_cols:
+    for r in filtered_untrimmed:
+        for m in metric_cols_untrimmed:
             a = anomaly_map.get(f"{r['date_range']}||{r['ad_group_id']}||{r['ssp']}||{m}")
             if a == "high":
                 anomaly_counts["high"] += 1
@@ -949,7 +1072,25 @@ def build_analysis(args_file, cid_map_default, cid_file, rules_json, filters_jso
     summary_vals = {m: {w: {"sum": 0.0, "count": 0} for w in sorted_weeks} for m in metric_cols}
     rule_flag_cell_count = 0
 
-    for gk, grp in sorted(groups.items(), key=lambda kv: (-rules_fired_map.get(kv[0], 0), kv[0])):
+    group_items = sorted(groups.items(), key=lambda kv: (-rules_fired_map.get(kv[0], 0), kv[0]))
+    groups_omitted = 0
+    if top_groups and len(group_items) > top_groups:
+        # Never drop a group that fired a rule — those are the answer to the
+        # user's goal. Fill the remaining slots with the biggest spenders, so
+        # what's dropped is genuinely low-signal (tiny/idle groups).
+        latest_cost = {}
+        for gk, grp in group_items:
+            row = grp["byWeek"].get(sorted_weeks[0]) if sorted_weeks else None
+            latest_cost[gk] = (to_float_or_none(row["metrics"].get(cost_col)) or 0) if (row and cost_col) else 0
+        fired = [it for it in group_items if rules_fired_map.get(it[0], 0) > 0]
+        rest = [it for it in group_items if rules_fired_map.get(it[0], 0) == 0]
+        rest.sort(key=lambda kv: -latest_cost.get(kv[0], 0))
+        kept = fired + rest[:max(0, top_groups - len(fired))]
+        groups_omitted = len(group_items) - len(kept)
+        kept_keys = {gk for gk, _ in kept}
+        group_items = [it for it in group_items if it[0] in kept_keys]
+
+    for gk, grp in group_items:
         r = grp["meta"]
         weeks_out = {}
         wow_out = {}
@@ -1008,7 +1149,7 @@ def build_analysis(args_file, cid_map_default, cid_file, rules_json, filters_jso
             "wow": wow_out,
         })
 
-    # summary row (avg for pct/roas/dollar/float, total for int — matches html's defaultAvg)
+    # summary row: avg for pct/roas/dollar/float, total for int
     summary_out = {}
     for m in metric_cols:
         mtype = metric_types[m]
@@ -1127,6 +1268,15 @@ def build_analysis(args_file, cid_map_default, cid_file, rules_json, filters_jso
             "filters": filters,
             "adGroupCount": len(groups),
             "sspCount": len({r["ssp"] for r in filtered}),
+            # Trim disclosure — always present so a lite run can never be
+            # mistaken for full coverage. Report these to the user verbatim.
+            "lite": bool(lite),
+            "metricsShown": len(metric_cols),
+            "metricsTotal": len(parsed["metric_cols"]),
+            "weeksShown": len(sorted_weeks),
+            "weeksTotal": len(parsed["weeks"]),
+            "groupsShown": len(out_groups),
+            "groupsOmitted": groups_omitted,
         },
         "groups": out_groups,
         "summary": summary_out,
@@ -1144,7 +1294,7 @@ def cmd_analyze(args):
 
 
 # ---------------------------------------------------------------------------
-# export (ported from exportCSV() in the html)
+# export
 # ---------------------------------------------------------------------------
 def cmd_export(args):
     result = build_analysis(args.file, args.cid_map_default, args.cid, args.rules, args.filters)
@@ -1199,7 +1349,18 @@ def main():
     p_full.add_argument("--rules", default=None, help="JSON list of {metric,dir,value}, max 3")
     p_full.add_argument("--filters", default=None)
     p_full.add_argument("--cid")
+    p_full.add_argument("--lite", action="store_true",
+                       help="Trim the group matrix: goal + core metrics, last 2 weeks, ~15 most relevant groups")
+    p_full.add_argument("--max-weeks", dest="max_weeks", type=int, default=None,
+                        help="Keep only the N most recent weeks (overrides the lite default)")
+    p_full.add_argument("--top-groups", dest="top_groups", type=int, default=None,
+                        help="Keep only N groups: all rule-firing ones first, then biggest spenders")
     p_full.set_defaults(func=cmd_full)
+
+    p_estimate = sub.add_parser("estimate")
+    p_estimate.add_argument("file")
+    p_estimate.add_argument("--cid")
+    p_estimate.set_defaults(func=cmd_estimate)
 
     p_allocation = sub.add_parser("allocation")
     p_allocation.add_argument("file")

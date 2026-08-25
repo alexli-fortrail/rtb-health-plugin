@@ -41,7 +41,7 @@ file has both `ROAS 0D / $3` and `ROAS 7D / $3`), ask which one(s) rather than
 guessing — getting the metric wrong wastes the whole downstream analysis.
 
 Rules format: up to 3, each `{"metric": <exact column name>, "dir": "below"|"above", "value": <number>}`.
-Chain semantics (ported exactly from the html, do not simplify):
+Chain semantics — do not simplify these, the drill-down depends on them:
 - Rule 1 flags matching cells across **all weeks** for **all groups**.
 - Rule 2+ only applies to groups whose **latest week** value already satisfied
   all prior rules.
@@ -51,20 +51,60 @@ Chain semantics (ported exactly from the html, do not simplify):
 Also ask, but don't force, optional narrowing filters (SSP, status, VA floor,
 anomalies-only) — map straight to `--filters`.
 
+### 1b. Size check — warn before spending, let the user choose
+Before the expensive run, size the job up (this is cheap — counts only):
+```bash
+python3 "$SKILL_DIR"/scripts/analyze.py estimate <file> [--cid <cid_file>]
+```
+Returns `band` (`light`/`medium`/`heavy`), the projected detailed output size,
+what the lite run would cost instead, and an `advice` line. Act on the band:
+
+- **`light`** — just proceed, no need to interrupt the user.
+- **`medium`** — proceed, but mention the lite option in one clause.
+- **`heavy`** — **stop and ask before running.** Say roughly:
+
+  > "这份文件比较大(N 个广告组 × M 周 × K 个指标,详细分析的数据量约 X MB),跑详细版会消耗较多 token。要跑详细版吗?还是先跑精简版(约 Y MB,快很多,结论一样准)?"
+
+  Then wait. Detailed → omit `--lite`. Lite → add `--lite`.
+
+Report the actual numbers from `estimate`, not vague adjectives, and be honest
+that it's a workload estimate rather than an exact token count. If the user
+doesn't answer or says "随便/whatever", default to **lite** — it's the
+recoverable choice: they can always ask for the detailed rerun, whereas tokens
+already spent can't be refunded.
+
 ### 2. Health check + analyze — one combined call
-Now that you know both the file and the goal, run **`full`**, not `health` and
-`analyze` separately — it parses the file once and returns both, which is
-noticeably faster than two round trips (each separate CLI call re-parses the
-whole file and pays its own Python startup cost):
+Now that you know the file, the goal, and which depth the user picked, run
+**`full`**, not `health` and `analyze` separately — it parses the file once and
+returns both, which is noticeably faster than two round trips (each separate
+CLI call re-parses the whole file and pays its own Python startup cost):
 ```bash
 python3 "$SKILL_DIR"/scripts/analyze.py full <file> \
   --rules '[{"metric":"CPA","dir":"below","value":5}]' \
   --filters '{}' \
+  [--lite] \
   [--cid <cid_file>]
 ```
 Returns `{"health": {...}, "analysis": {...}}`. This step covers the health
 check (`result.health`); step 3 below uses `result.analysis` from this same
 call — don't re-run `analyze` separately.
+
+**What `--lite` changes** (and what it doesn't): it trims the per-group ×
+week × metric matrix to the goal metrics plus a few core ones (Valid Action,
+Raw Cost, CPA/CPI, Win Rate, CPM), the 2 most recent weeks, and ~15 groups —
+every rule-firing group is kept, the rest filled by biggest spenders.
+Measured on a real 188-group × 8-week × 35-metric file: **8.86 MB → 0.11 MB**.
+The whole health scan, `sspGoalEval`, and `anomalyCounts` are **unaffected** —
+verified identical on both files, same qualifying SSPs, same CPA, same anomaly
+totals. Nothing is approximated; there is simply less of it.
+
+`--max-weeks N` / `--top-groups N` override the lite defaults if the user wants
+a middle ground (e.g. lite depth but all 8 weeks of history).
+
+**Always disclose the trim.** `analysis.meta` carries `lite`, `metricsShown`/
+`metricsTotal`, `weeksShown`/`weeksTotal`, `groupsShown`/`groupsOmitted` — if
+`groupsOmitted > 0`, say so when presenting, so a lite run is never mistaken
+for full coverage.
 
 `result.health` carries two scans:
 - **All Time**: total valid action, aggregate CPA (`total cost / total valid
@@ -82,9 +122,9 @@ call — don't re-run `analyze` separately.
   exists in this file.
 
 The response also carries a few top-level sections beyond All Time/Latest
-Week, added because real AM/CM Slack conversations across 5 campaign channels
-consistently centered on these — include whichever are non-null for this
-file, and say plainly when one is missing (don't fabricate it):
+Week — these reflect the dimensions campaign managers actually optimize on.
+Include whichever are non-null for this file, and say plainly when one is
+missing (don't fabricate it):
 - **`roasWindows`** — every ROAS-typed column in the file (D0/D7/whatever
   windows exist) shown side by side with its own WoW%, not just one. AMs
   track these simultaneously, not as a single number.
@@ -127,6 +167,13 @@ file, and say plainly when one is missing (don't fabricate it):
 
 This is working data for the report generated in step 5 — don't dump it into
 chat. Standard output is the HTML report; chat gets a short summary (step 6).
+
+**Hard rule — never read this JSON wholesale.** Always redirect it to a file
+(`> out.json`) and pull out only what you need with a small `python3 -c`
+extraction. A detailed run reaches **8-9 MB** on a large file; reading that
+into context in one go would burn an enormous number of tokens for no benefit,
+and is the single most expensive mistake available in this flow. This applies
+even in lite mode — the habit should be the same regardless of size.
 
 ### 3. Analyze
 No new command here — use `result.analysis` from the `full` call in step 2.
@@ -280,7 +327,7 @@ that's untracked leakage worth flagging. Don't dump all 50+ rows.
   everywhere, not just in the health check.
 - **By design, not volume-weighted**: `summary`, `sspBreakdown`, `roasWindows`,
   and `ctcvVtcv` average each row's own ratio value directly (matches the
-  original html's convention) rather than reconstructing a weighted average
+  established convention) rather than reconstructing a weighted average
   from raw numerator/denominator columns. This was deliberately left as-is
   (confirmed with the user 2026-07-29) — unlike Win Rate (Bid/Win), CPM
   (Cost/Impression), and CPA (Cost/Valid Action), metrics like ROAS, CTCV
@@ -316,3 +363,11 @@ that's untracked leakage worth flagging. Don't dump all 50+ rows.
   that panel — don't treat a missing diagnosis panel as a script bug.
 - `render_report.py`'s campaign-name guess (from ad group naming or the
   filename) is a heuristic — pass `--title` explicitly if it guesses wrong.
+- `estimate`'s sizing comes from a bytes-per-cell constant calibrated against
+  real files (~170 bytes per group x week x metric). It is a **workload**
+  signal, not a token count — real token use depends on how much of the output
+  gets read back. Don't present it to the user as an exact token figure.
+- Token cost of the skill itself is reported by `claude plugin details
+  rtb-health` (~128 tok always-on, ~4.7k tok per invocation at time of
+  writing) — that figure covers loading and invoking the skill, and is separate
+  from the data-volume estimate above.
