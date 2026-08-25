@@ -117,12 +117,23 @@ pip3 install pandas openpyxl
 
 ## 改动之后
 
-推之前先本地验证清单没写坏:
+### ⚠️ 必须 bump 版本号,否则更新不会生效
 
-```bash
-claude plugin validate ./ --strict
+这是实测踩过的坑:**只改内容、不改 `.claude-plugin/plugin.json` 里的 `version`,使用者那边不会拿到更新**——即使他们开了自动更新、即使手动跑 `/plugin update`,装的还是旧版本(缓存目录是按版本号命名的)。
+
+所以每次改动都要:
+
+1. 改 `plugin.json` 的 `version`(改了功能 → 次版本号 +1,例如 `1.1.0` → `1.2.0`;只修 bug → `1.1.1`)
+2. 本地验证清单没写坏:
+   ```bash
+   claude plugin validate ./ --strict
+   ```
+3. commit + push
+
+开了自动更新的使用者下次启动 Claude Code 就会拿到;想立刻更新的可以手动跑:
+
 ```
-
-然后正常 commit + push,开了自动更新的使用者下次启动就会拿到。
+/plugin update rtb-health@appier-rtb-tools
+```
 
 > 注意:这个 repo 里**不要提交任何真实的 campaign 数据**(导出文件、生成的报告、CID 对照表)。`.gitignore` 已经挡掉了常见的几种,但提交前还是看一眼 `git status`。
